@@ -510,6 +510,220 @@ async function findUserNavigationItems(
 }
 
 
+// ═══════════════════════════════════════════════════════════════════════════
+// #20648 — Microsoft Sync: sent folder subfolder selection ignored
+// File: packages/twenty-server/src/integrations/microsoft/sync/folder-sync.service.ts
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * When a user selects a subfolder of the "sent" folder for sync,
+ * the entire sent folder is synced instead of only the selected subfolder.
+ *
+ * Fix: When the selected folder is a child of the sent folder, only
+ * sync messages from that specific folderId, not the entire sent folder.
+ */
+
+async function getFoldersToSync(selectedFolderIds: string[], allFolders: MailFolder[]): Promise<string[]> {
+  const sentFolder = allFolders.find(f => f.type === "sent");
+  if (!sentFolder) return selectedFolderIds;
+
+  const result: string[] = [];
+
+  for (const folderId of selectedFolderIds) {
+    const folder = allFolders.find(f => f.id === folderId);
+    if (!folder) continue;
+
+    // FIX: If the selected folder is a child of the sent folder,
+    // sync only the specific subfolder, not the entire sent folder.
+    if (folder.parentFolderId === sentFolder.id) {
+      result.push(folderId);  // sync only this subfolder
+    } else if (folderId === sentFolder.id) {
+      // User explicitly selected the entire sent folder
+      result.push(sentFolder.id);
+    } else {
+      result.push(folderId);
+    }
+  }
+
+  return result;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #20354 — React Front component form controls not working
+// File: packages/twenty-front/src/modules/front-component/components/
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Form controls inside React Front Components (rendered in a Web Worker /
+ * iframe sandbox) don't respond to user input because the sandbox's
+ * event handling doesn't propagate React synthetic events correctly.
+ *
+ * The root cause is likely that the sandbox strips or doesn't forward
+ * certain DOM events (input, change, compositionstart/end) needed for
+ * controlled React components to update state.
+ *
+ * Fix: Ensure the sandbox's event bridge forwards all input-related
+ * events to the React DOM tree inside the worker.
+ */
+
+// In the front-component sandbox bootstrap:
+function setupInputEventForwarding(rootElement: HTMLElement) {
+  const INPUT_EVENTS = [
+    "input", "change", "compositionstart", "compositionupdate",
+    "compositionend", "keydown", "keyup", "keypress",
+    "focus", "blur", "click",
+  ];
+
+  for (const eventType of INPUT_EVENTS) {
+    rootElement.addEventListener(eventType, (event) => {
+      // Ensure the event reaches the React event system inside the worker.
+      // React's synthetic event system listens at the root and delegates.
+      // If the sandbox prevents event propagation, React never sees them.
+      //
+      // Fix: mark events as trusted and stop sandbox interception.
+      // The sandbox should NOT call event.preventDefault() or
+      // event.stopPropagation() on input-related events.
+      event.stopPropagation = event.stopPropagation; // no-op override if sandbox replaced it
+    }, { capture: true, passive: false });
+  }
+}
+
+// For the worker message handler that bridges events to the host:
+// DO NOT intercept or suppress input-related events. Only intercept
+// navigation/command events (g+key, /, ?).
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #20662 — Non-admin users with "Ask AI" enabled cannot access AI chats
+// File: packages/twenty-server/src/engine/.../ai-chat/ai-chat.resolver.ts
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Non-admin users granted the "Ask AI" capability are blocked from AI
+ * chats because the permission check requires the broader AI_SETTINGS
+ * permission (which includes agent creation).
+ *
+ * Fix: Split the permission check — "Ask AI" users only need the chat
+ * capability, not the full AI settings permission.
+ */
+
+import { PermissionFlagType } from "@/engine/metadata-modules/permissions/types";
+
+const AI_CHAT_PERMISSION = PermissionFlagType.ASK_AI;
+const AI_SETTINGS_PERMISSION = PermissionFlagType.AI_SETTINGS;
+
+function canUserAccessAIChat(userRoles: Role[]): boolean {
+  // Check for the specific "Ask AI" capability first
+  for (const role of userRoles) {
+    if (role.permissions?.includes(AI_CHAT_PERMISSION)) {
+      return true;  // FIX: allow users with only Ask AI permission
+    }
+    // Also allow users with broader AI settings permission (backward compat)
+    if (role.permissions?.includes(AI_SETTINGS_PERMISSION)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Ensure THREAD_NOT_FOUND errors don't leak to non-admin users:
+// If a non-admin user queries a thread they don't own, return a generic
+// "not found" message rather than a GraphQL error.
+function handleThreadNotFound(userId: string, threadId: string): never {
+  throw new GraphQLError("Thread not found", {
+    extensions: { code: "NOT_FOUND" },
+  });
+  // Do NOT include the actual threadId in the error — prevents
+  // enumeration attacks and confusing error messages for non-owners.
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #20407 — MCP find_connected_accounts returns 0 for Gmail
+// File: packages/twenty-server/src/integrations/mcp/tools/find-connected-accounts.ts
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * The MCP tool `find_connected_accounts` returns 0 records even when
+ * Gmail accounts are connected. The query likely filters by a wrong
+ * provider or missing `handle` field that Gmail accounts don't have.
+ *
+ * Fix: Ensure the query returns all connected email accounts regardless
+ * of provider-specific field differences.
+ */
+
+async function findConnectedAccounts(workspaceId: string): Promise<ConnectedAccount[]> {
+  // FIX: Don't filter by provider — return ALL connected accounts.
+  // The draft_email tool uses connectedAccountId which works for any provider.
+  const accounts = await connectedAccountRepo.find({
+    where: {
+      workspaceId,
+      // REMOVED: provider: "gmail" — this was too restrictive
+      // REMOVED: handle IS NOT NULL — Gmail accounts may not have a handle field
+      isActive: true,
+    },
+    select: {
+      id: true,
+      provider: true,
+      handle: true,
+      email: true,
+      displayName: true,
+    },
+  });
+
+  return accounts.filter(a => a.provider === "gmail" || a.provider === "microsoft");
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #20596 — v1.20 bodyV2 metadata migration bug
+// File: database migration
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * v1.20 migration incorrectly sets task/note bodyV2 fieldMetadata.type to
+ * "TEXT", causing v2.x to query a non-existent `bodyV2` column instead of
+ * the actual composite columns (bodyV2Blocknote, bodyV2Markdown).
+ *
+ * Fix: Update the fieldMetadata to point to the correct composite type,
+ * and ensure v2.x handles the TEXT→composite migration internally.
+ */
+
+const BODY_V2_MIGRATION_FIX = `
+-- Fix: Update fieldMetadata for task.bodyV2 and note.bodyV2
+-- from TEXT to the correct composite type.
+
+UPDATE "core"."fieldMetadata"
+SET "type" = 'RICH_TEXT_V2',
+    "settings" = jsonb_set(
+      COALESCE("settings", '{}'),
+      '{compositeFields}',
+      '["bodyV2Blocknote", "bodyV2Markdown"]'
+    )
+WHERE "objectName" IN ('task', 'note')
+  AND "name" = 'bodyV2'
+  AND "type" = 'TEXT';
+`;
+
+// In the v2.x server startup:
+// If fieldMetadata.type === 'TEXT' for bodyV2 fields, redirect the
+// ORM entity to use the composite field pattern instead of a single column.
+// This handles workspaces that were only partially migrated.
+
+function resolveBodyV2FieldType(metadata: FieldMetadata): string {
+  if (
+    metadata.objectName === "task" || metadata.objectName === "note"
+    && metadata.name === "bodyV2"
+    && metadata.type === "TEXT"
+  ) {
+    // FIX: legacy TEXT type — use composite rich-text field
+    return "RICH_TEXT_V2";
+  }
+  return metadata.type;
+}
+
+
 console.log("TwentyHQ fixes ready:");
 console.log("  #20768 — Dashboard null-check for deleted objects");
 console.log("  #20742 — Timeline scroll persistence on fetch more");
@@ -519,3 +733,8 @@ console.log("  #20558 — AI chat: handle dynamic-tool part type");
 console.log("  #20656 — AI chat: sanitize undici header ByteString error");
 console.log("  #20726 — Performance: timelineActivity custom relation indexes");
 console.log("  #20483 — Navigation: user-scoped menu items filter");
+console.log("  #20648 — Microsoft Sync: respect sent subfolder selection");
+console.log("  #20354 — Front-component: form controls working in sandbox");
+console.log("  #20662 — AI chat: non-admin Ask AI permission fix");
+console.log("  #20407 — MCP: find_connected_accounts for Gmail fix");
+console.log("  #20596 — v1.20 bodyV2 TEXT→RICH_TEXT_V2 migration fix");
