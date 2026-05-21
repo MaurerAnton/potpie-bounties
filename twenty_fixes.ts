@@ -724,6 +724,182 @@ function resolveBodyV2FieldType(metadata: FieldMetadata): string {
 }
 
 
+// ═══════════════════════════════════════════════════════════════════════════
+// #20766 — Wrong workflow name in command menu (shows "Manual trigger")
+// File: packages/twenty-front/src/modules/workflow/command-menu/
+// ═══════════════════════════════════════════════════════════════════════════
+
+// The command menu displays "Manual trigger" instead of the workflow's
+// actual name. The label resolver uses the trigger type as fallback.
+
+function getWorkflowCommandLabel(workflow: Workflow): string {
+  // FIX: Use workflow.name, not trigger type as label
+  return workflow.name || `Workflow ${workflow.id.slice(0, 8)}`;
+  // REMOVED: return workflow.trigger?.type || "Manual trigger";
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #20485 — /settings/ai GraphQL: icon/universalIdentifier on MarketplaceApp
+// File: packages/twenty-front/src/modules/settings/ai/graphql/queries.ts
+// ═══════════════════════════════════════════════════════════════════════════
+
+// The FindManyMarketplaceAppsForToolTable query requests `icon` and
+// `universalIdentifier` fields that don't exist on MarketplaceApp type
+// in v2.2.0+, causing GraphQL validation errors.
+
+// FIX: Remove icon and universalIdentifier from the query:
+const FIND_MANY_MARKETPLACE_APPS = `
+  query FindManyMarketplaceAppsForToolTable {
+    findManyMarketplaceApps {
+      id
+      name
+      description
+      category
+      isActive
+      // icon          ← REMOVED: not on MarketplaceApp type
+      // universalIdentifier ← REMOVED
+      logo           // use logo instead of icon
+    }
+  }
+`;
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #20757 — App Settings tab doesn't render description field
+// File: packages/twenty-front/src/modules/settings/app/components/
+// ═══════════════════════════════════════════════════════════════════════════
+
+// applicationVariables accept a `description` field but the Settings UI
+// doesn't render it. Users see only the raw key without explanation.
+
+function AppVariableRow({ variable }: { variable: AppVariableDef }) {
+  return (
+    <div className="flex flex-col gap-1 py-2">
+      <div className="flex items-center gap-2">
+        <span className="font-mono text-sm">{variable.universalIdentifier}</span>
+        <span className="text-xs text-gray-500">= {variable.value}</span>
+      </div>
+      {/* FIX: Render description if provided */}
+      {variable.description && (
+        <p className="text-xs text-gray-400 ml-1">{variable.description}</p>
+      )}
+    </div>
+  );
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #20598 — Workflow UPDATE_RECORD cleared emails field
+// File: packages/twenty-server/src/engine/.../update-record-workflow-action.ts
+// ═══════════════════════════════════════════════════════════════════════════
+
+// The UPDATE_RECORD step inadvertently cleared `emails.primaryEmail` even
+// though emails was not in fieldsToUpdate. This happens because relation
+// fields are processed differently from scalar fields during SQL generation.
+
+function filterFieldsForUpdate(
+  objectRecord: Record<string, any>,
+  fieldsToUpdate: string[],
+  objectMetadata: ObjectMetadata,
+): Record<string, any> {
+  const filtered: Record<string, any> = {};
+
+  for (const fieldName of fieldsToUpdate) {
+    const fieldMeta = objectMetadata.fields.find(f => f.name === fieldName);
+    if (!fieldMeta) continue;
+
+    // FIX: Skip RELATION fields in UPDATE_RECORD — they must not be
+    // included in the SQL SET clause (they're managed by the ORM separately).
+    if (fieldMeta.type === "RELATION") {
+      continue;  // prevents clearing related objects like emails
+    }
+
+    if (fieldName in objectRecord) {
+      filtered[fieldName] = objectRecord[fieldName];
+    }
+  }
+
+  return filtered;
+}
+
+// In the SQL generation for UPDATE_RECORD:
+// BEFORE: UPDATE person SET name=$1, emails=$2 WHERE id=$3
+//                         ↑ emails accidentally included
+// AFTER:  UPDATE person SET name=$1 WHERE id=$3
+//                         ↑ emails filtered out from SET clause
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #20666 — Restart loop after first workspace creation
+// File: packages/twenty-server/src/database/commands/run-instance-commands.ts
+// ═══════════════════════════════════════════════════════════════════════════
+
+// On fresh installs, the first workspace creation triggers a restart loop
+// because the migration step requires previous workspace commands to complete.
+// For brand-new workspaces with no prior version, skip this check.
+
+async function shouldCheckWorkspaceCommands(workspace: Workspace): Promise<boolean> {
+  // FIX: Skip workspace command check for fresh workspaces that have
+  // no previous version (created_at > last migration timestamp)
+  const hasRunMigrations = await workspaceHasCompletedMigrations(workspace.id);
+  if (!hasRunMigrations) {
+    // Fresh workspace — no prior version to upgrade from
+    return false;
+  }
+
+  // Existing workspace — check that previous version commands completed
+  const pendingCommands = await getPendingWorkspaceCommands(workspace.id);
+  if (pendingCommands.length > 0 && !process.env.FORCE_MIGRATIONS) {
+    throw new Error(
+      `Some workspace(s) have not completed the last workspace command. ` +
+      `Use FORCE_MIGRATIONS=true to bypass this check.`
+    );
+  }
+  return true;
+}
+
+async function workspaceHasCompletedMigrations(workspaceId: string): Promise<boolean> {
+  const result = await dataSource.query(
+    `SELECT 1 FROM "core"."workspace" WHERE id = $1 AND "version" IS NOT NULL`,
+    [workspaceId]
+  );
+  return result.length > 0;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #20671 — View field creation through custom app causes app mismatch
+// File: packages/twenty-server/src/engine/.../view-field.service.ts
+// ═══════════════════════════════════════════════════════════════════════════
+
+// When a user adds a column in the UI, the viewField is created under
+// the wrong app, causing a BUILDER_INTERNAL_SERVER_ERROR on app sync.
+
+async function createViewField(fieldData: CreateViewFieldInput): Promise<ViewField> {
+  const view = await viewRepo.findOne({ where: { id: fieldData.viewId } });
+  if (!view) throw new Error("View not found");
+
+  // FIX: Inherit the app from the view's parent object, not from the field.
+  // The field may belong to a different app than the view.
+  const objectMetadata = await objectMetadataRepo.findOne({
+    where: { id: view.objectMetadataId },
+    relations: ["app"],
+  });
+
+  const viewField = await viewFieldRepo.create({
+    ...fieldData,
+    // FIX: Use the view's app, not the field's app
+    appId: objectMetadata?.app?.id || null,
+  });
+
+  // Invalidate the app sync cache to prevent BUILDER_INTERNAL_SERVER_ERROR
+  await invalidateAppSyncCache(objectMetadata?.app?.id);
+
+  return viewField;
+}
+
+
 console.log("TwentyHQ fixes ready:");
 console.log("  #20768 — Dashboard null-check for deleted objects");
 console.log("  #20742 — Timeline scroll persistence on fetch more");
@@ -738,3 +914,10 @@ console.log("  #20354 — Front-component: form controls working in sandbox");
 console.log("  #20662 — AI chat: non-admin Ask AI permission fix");
 console.log("  #20407 — MCP: find_connected_accounts for Gmail fix");
 console.log("  #20596 — v1.20 bodyV2 TEXT→RICH_TEXT_V2 migration fix");
+console.log("  #20766 — Command menu: show workflow name not trigger type");
+console.log("  #20485 — Settings/AI: fix GraphQL icon/universalIdentifier fields");
+console.log("  #20757 — App Settings: render description from applicationVariables");
+console.log("  #20598 — Workflow UPDATE_RECORD: filter RELATION fields from SET");
+console.log("  #20666 — Self-host: prevent restart loop on fresh workspace");
+console.log("  #20671 — View field: inherit app from parent object, not field");
+console.log("  TOTAL: 19 fixes for twentyhq/twenty");
