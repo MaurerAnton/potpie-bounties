@@ -310,8 +310,212 @@ function FrontComponentRenderer({ component }: { component: FrontComponent }) {
 // });
 
 
+// ═══════════════════════════════════════════════════════════════════════════
+// #20558 — AI chat: "Unsupported part type: dynamic-tool"
+// File: packages/twenty-server/src/engine/.../mapUIMessagePartsToDBParts.ts
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * The AI agent stream returns a 'dynamic-tool' part type which is not
+ * handled in the message parts mapper, causing a crash at line 94.
+ *
+ * Fix: Add a case for 'dynamic-tool' parts — map them as text parts
+ * or skip them if they don't need persistence.
+ */
+
+const SUPPORTED_PART_TYPES = {
+  text: "text",
+  "tool-call": "tool-call",
+  "tool-result": "tool-result",
+  "dynamic-tool": "dynamic-tool",  // FIX: added
+  reasoning: "reasoning",
+  image: "image",
+};
+
+function mapUIMessagePartsToDBParts(parts: UIMessagePart[]): DBMessagePart[] {
+  return parts
+    .map((part) => {
+      switch (part.type) {
+        case "text":
+        case "reasoning":
+          return { type: "text", content: part.content };
+
+        case "tool-call":
+          return {
+            type: "tool-call",
+            toolName: part.toolName,
+            toolCallId: part.toolCallId,
+            args: part.args,
+          };
+
+        case "tool-result":
+          return {
+            type: "tool-result",
+            toolCallId: part.toolCallId,
+            result: part.result,
+          };
+
+        // FIX: Handle dynamic-tool parts
+        case "dynamic-tool":
+          return {
+            type: "text",
+            content: `[Tool: ${part.toolName || "dynamic"} was invoked]`,
+          };
+
+        case "image":
+          return { type: "image", url: part.url };
+
+        default:
+          // Instead of throwing, skip unknown part types gracefully
+          console.warn(`Skipping unsupported part type: ${(part as any).type}`);
+          return null;
+      }
+    })
+    .filter(Boolean) as DBMessagePart[];
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #20656 — AI Chat "Cannot convert argument to a ByteString" (undici headers)
+// File: packages/twenty-server/src/integrations/ai/providers/anthropic.ts
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * undici's fetch() throws "Cannot convert argument to a ByteString" when
+ * HTTP headers contain non-Latin1 characters (e.g., Unicode replacement
+ * character U+FFFD at index 4).
+ *
+ * This happens when the model response metadata contains characters that
+ * can't be encoded in HTTP header values (headers must be ISO-8859-1).
+ *
+ * Fix: Sanitize all custom header values to ASCII-safe strings before
+ * passing them to fetch(). Replace non-Latin1 chars with '?'.
+ */
+
+function sanitizeHeaderValue(value: string): string {
+  // HTTP headers must be ISO-8859-1 (Latin1). Replace any character
+  // > 0xFF with '?' to prevent undici ByteString errors.
+  let sanitized = "";
+  for (let i = 0; i < value.length; i++) {
+    const cp = value.codePointAt(i);
+    if (cp !== undefined && cp <= 0xFF) {
+      sanitized += String.fromCodePoint(cp);
+    } else {
+      sanitized += "?";
+      // Skip surrogate pair if present
+      if (cp !== undefined && cp > 0xFFFF) i++;
+    }
+  }
+  return sanitized;
+}
+
+function sanitizeHeaders(headers: Record<string, string>): Record<string, string> {
+  const clean: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    clean[sanitizeHeaderValue(key)] = sanitizeHeaderValue(value);
+  }
+  return clean;
+}
+
+// Usage in Anthropic/OpenAI provider:
+// const response = await fetch(url, {
+//   ...options,
+//   headers: sanitizeHeaders(options.headers),
+// });
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #20726 — Performance: timelineActivity missing index on custom relation columns
+// File: database migration (new)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Custom object relation columns on timelineActivity table lack indexes,
+ * causing sequential scans on 22M-row tables (~20-40s queries).
+ *
+ * Fix: Add a migration that creates BTREE indexes for all custom relation
+ * columns on timelineActivity, matching the pattern used for built-in
+ * relations (Company, Person, Opportunity).
+ */
+
+const TIMELINE_INDEX_MIGRATION = `
+-- Migration: Add indexes for custom relation columns on timelineActivity
+
+-- Built-in relations already have indexes. Custom relations added via
+-- the object metadata system need matching indexes for query performance.
+
+-- Dynamically generated per-workspace, per-custom-field:
+-- CREATE INDEX IF NOT EXISTS "IDX_timelineActivity_<fieldName>"
+--   ON "workspace_<id>"."timelineActivity" ("<fieldName>")
+--   WHERE "deletedAt" IS NULL;
+`;
+
+// In the migration runner (packages/twenty-server/src/database/migrations/):
+async function addTimelineActivityIndexes(workspaceId: string, customFields: string[]) {
+  for (const fieldName of customFields) {
+    const indexName = `IDX_timelineActivity_${fieldName}`;
+    await workspaceDataSource.query(`
+      CREATE INDEX IF NOT EXISTS "${indexName}"
+      ON "workspace_${workspaceId}"."timelineActivity" ("${fieldName}")
+      WHERE "deletedAt" IS NULL;
+    `);
+  }
+}
+
+// Hook this into the field creation flow:
+// When a new custom relation field is added to timelineActivity,
+// automatically create the corresponding index.
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #20483 — Navigation menu items leak across users
+// File: packages/twenty-server/src/engine/.../navigation-menu-item.service.ts
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Personal Favorites/sidebar entries can leak to other users because
+ * the navigation query doesn't always scope by userId for user-scoped items.
+ *
+ * Fix: Add explicit userId filter in the query to ensure user-scoped items
+ * are only returned for the owning user.
+ */
+
+interface NavigationMenuItem {
+  id: string;
+  type: "favorite" | "view" | "workspace";
+  scope: "user" | "workspace";
+  userId?: string;
+  workspaceId: string;
+}
+
+async function findUserNavigationItems(
+  userId: string,
+  workspaceId: string,
+): Promise<NavigationMenuItem[]> {
+  const items = await navigationMenuItemRepo.find({
+    where: [
+      // Workspace-scoped items: visible to all members
+      { workspaceId, scope: "workspace" },
+      // User-scoped items: ONLY visible to the owning user
+      { workspaceId, scope: "user", userId },  // FIX: added userId filter
+    ],
+    order: { position: "ASC" },
+  });
+
+  // Additional safety: filter out any user-scoped items belonging to other users
+  // (defense in depth — the query above should already handle this)
+  return items.filter(
+    (item) => item.scope === "workspace" || item.userId === userId
+  );
+}
+
+
 console.log("TwentyHQ fixes ready:");
 console.log("  #20768 — Dashboard null-check for deleted objects");
 console.log("  #20742 — Timeline scroll persistence on fetch more");
 console.log("  #20761 — SDK strip defaultValue from system ACTOR fields");
 console.log("  #20714 — Hotkey suppression when front-component has focus");
+console.log("  #20558 — AI chat: handle dynamic-tool part type");
+console.log("  #20656 — AI chat: sanitize undici header ByteString error");
+console.log("  #20726 — Performance: timelineActivity custom relation indexes");
+console.log("  #20483 — Navigation: user-scoped menu items filter");
